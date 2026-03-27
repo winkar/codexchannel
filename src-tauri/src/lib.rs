@@ -101,13 +101,19 @@ pub fn run() {
     let config_result = Config::load();
 
     // Initialise logging when config is available.
+    let mut should_exit = false;
     if let Ok(ref cfg) = config_result {
         let _ = logging::init(&cfg.log_path);
         logging::info("starting telegram-codex-bridge (tauri)");
-        // Acquire single-instance lock; failure is non-fatal in GUI mode.
+        // Enforce single-instance mode before creating any window or tray icon.
         if let Err(e) = singleton::acquire(&cfg.lock_path) {
             logging::error(&format!("failed to acquire singleton lock: {e:#}"));
+            should_exit = true;
         }
+    }
+
+    if should_exit {
+        return;
     }
 
     tauri::Builder::default()
@@ -140,8 +146,8 @@ pub fn run() {
                     tauri_app.manage(app_instance.session.clone());
                     tauri_app.manage(config);
 
-                    // Spawn the Telegram long-polling loop as a background task
-                    tokio::spawn(async move {
+                    // Spawn the Telegram long-polling loop on Tauri's async runtime.
+                    tauri::async_runtime::spawn(async move {
                         if let Err(e) = app_instance.run().await {
                             logging::error(&format!("Bridge loop terminated: {e:#}"));
                         }

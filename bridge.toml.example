@@ -1,0 +1,10 @@
+telegram_bot_token = "123456:replace-me"
+telegram_allowed_user_id = 123456789
+codex_cwd = "C:/Users/you/workspace"
+
+# Optional
+# codex_binary = "codex"
+# codex_model = "gpt-5.4"
+# codex_approval_policy = "never"
+# poll_timeout_seconds = 30
+# update_limit = 50

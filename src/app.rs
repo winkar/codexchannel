@@ -3,7 +3,7 @@ use crate::{
     commands::BotCommand,
     config::Config,
     logging,
-    state::{SessionSnapshot, SharedSessionState},
+    state::{ApprovalDecision, SessionSnapshot, SharedSessionState},
     telegram::{TelegramClient, TelegramMessage, is_telegram_poll_conflict},
 };
 use anyhow::{Result, anyhow};
@@ -27,6 +27,7 @@ impl App {
             config.codex_cwd.clone(),
             config.codex_model.clone(),
             config.codex_approval_policy.clone(),
+            config.codex_sandbox_mode.clone(),
         );
         Ok(Self {
             config: Arc::new(config),
@@ -210,6 +211,61 @@ impl App {
                         .await?;
                 }
             }
+            BotCommand::Approve { for_session } => {
+                logging::info(&format!(
+                    "handling /approve{}",
+                    if for_session { " session" } else { "" }
+                ));
+                let snapshot = self.session.snapshot().await;
+                if snapshot.pending_approval_message.is_none() {
+                    self.telegram
+                        .send_message(message.chat.id, "No pending approval.")
+                        .await?;
+                    return Ok(());
+                }
+                if for_session && !snapshot.pending_approval_supports_session {
+                    self.telegram
+                        .send_message(
+                            message.chat.id,
+                            "This approval does not support session-wide approval. Use /approve or /deny.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let decision = if for_session {
+                    ApprovalDecision::AcceptForSession
+                } else {
+                    ApprovalDecision::Accept
+                };
+                if self.session.resolve_pending_approval(decision).await {
+                    self.telegram
+                        .send_message(message.chat.id, approval_acknowledgement(decision))
+                        .await?;
+                } else {
+                    self.telegram
+                        .send_message(message.chat.id, "Pending approval already expired.")
+                        .await?;
+                }
+            }
+            BotCommand::Deny => {
+                logging::info("handling /deny");
+                if self
+                    .session
+                    .resolve_pending_approval(ApprovalDecision::Decline)
+                    .await
+                {
+                    self.telegram
+                        .send_message(
+                            message.chat.id,
+                            approval_acknowledgement(ApprovalDecision::Decline),
+                        )
+                        .await?;
+                } else {
+                    self.telegram
+                        .send_message(message.chat.id, "No pending approval.")
+                        .await?;
+                }
+            }
             BotCommand::Prompt(prompt) => {
                 logging::info(&format!("handling prompt len={}", prompt.len()));
                 if self.session.has_active_turn().await {
@@ -260,15 +316,27 @@ impl App {
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
         let app = self.clone();
+        let last_rendered = Arc::new(Mutex::new(String::new()));
         tokio::spawn(async move {
             let result = app
-                .run_turn(chat_id, thread_id, prompt, message_id, cancel)
+                .run_turn(
+                    chat_id,
+                    thread_id,
+                    prompt,
+                    message_id,
+                    cancel,
+                    last_rendered.clone(),
+                )
                 .await;
             if let Err(error) = result {
                 logging::error(&format!("turn failed: {error:#}"));
                 let _ = app
-                    .telegram
-                    .edit_message(chat_id, message_id, &format!("Turn failed:\n{error:#}"))
+                    .render_progress_message(
+                        chat_id,
+                        message_id,
+                        &last_rendered,
+                        &format!("Turn failed:\n{error:#}"),
+                    )
                     .await;
             }
             app.session.clear_active_turn().await;
@@ -282,14 +350,15 @@ impl App {
         prompt: String,
         message_id: i64,
         cancel: CancellationToken,
+        last_rendered: Arc<Mutex<String>>,
     ) -> Result<()> {
-        let last_rendered = Arc::new(Mutex::new(String::new()));
         logging::info(&format!("starting turn for thread {thread_id}"));
         let result = self
             .codex
             .run_turn(&thread_id, &prompt, cancel, |event| {
                 let session = self.session.clone();
                 let telegram = self.telegram.clone();
+                let app = self.clone();
                 let last_rendered = last_rendered.clone();
                 async move {
                     match event {
@@ -300,18 +369,34 @@ impl App {
                             session.set_active_turn_id(turn_id).await;
                         }
                         TurnEvent::AssistantDelta(text) => {
-                            let mut current = last_rendered.lock().await;
-                            if text != *current {
-                                telegram.edit_message(chat_id, message_id, &text).await?;
-                                *current = text;
-                            }
+                            app.render_progress_message(chat_id, message_id, &last_rendered, &text)
+                                .await?;
                         }
                         TurnEvent::Status(text) => {
-                            let mut current = last_rendered.lock().await;
+                            let current = last_rendered.lock().await.clone();
                             if current.is_empty() {
-                                telegram.edit_message(chat_id, message_id, &text).await?;
-                                *current = text;
+                                app.render_progress_message(
+                                    chat_id,
+                                    message_id,
+                                    &last_rendered,
+                                    &text,
+                                )
+                                .await?;
                             }
+                        }
+                        TurnEvent::ApprovalRequested(approval) => {
+                            let approval_message = approval.message.clone();
+                            session.set_pending_approval(approval).await;
+                            if last_rendered.lock().await.is_empty() {
+                                app.render_progress_message(
+                                    chat_id,
+                                    message_id,
+                                    &last_rendered,
+                                    "Waiting for approval...",
+                                )
+                                .await?;
+                            }
+                            telegram.send_message(chat_id, &approval_message).await?;
                         }
                     }
                     Ok(())
@@ -326,10 +411,11 @@ impl App {
             result.interrupted,
             final_text.len()
         ));
-        if final_text != final_cache {
-            self.telegram
-                .edit_message(chat_id, message_id, &final_text)
-                .await?;
+        if self
+            .render_progress_message(chat_id, message_id, &last_rendered, &final_text)
+            .await?
+        {
+            logging::info("rendered final telegram edit");
         } else {
             logging::info("skipping final telegram edit because content is unchanged");
         }
@@ -344,11 +430,31 @@ impl App {
                 "/new - start a new Codex thread\n",
                 "/use <thread_id> - switch active thread\n",
                 "/status - show current state\n",
-                "/stop - interrupt running turn\n\n",
+                "/stop - interrupt running turn\n",
+                "/approve [session] - approve pending action\n",
+                "/deny - decline pending action\n\n",
                 "{}"
             ),
             render_status(&snapshot, &self.config)
         )
+    }
+
+    async fn render_progress_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        last_rendered: &Arc<Mutex<String>>,
+        text: &str,
+    ) -> Result<bool> {
+        let mut current = last_rendered.lock().await;
+        if text == *current {
+            return Ok(false);
+        }
+        self.telegram
+            .edit_message(chat_id, message_id, text)
+            .await?;
+        *current = text.to_string();
+        Ok(true)
     }
 }
 
@@ -368,6 +474,11 @@ fn render_status(snapshot: &SessionSnapshot, config: &Config) -> String {
     let _ = writeln!(text, "approval_policy: {}", config.codex_approval_policy);
     let _ = writeln!(
         text,
+        "sandbox_mode: {}",
+        config.codex_sandbox_mode.as_deref().unwrap_or("(default)")
+    );
+    let _ = writeln!(
+        text,
         "thread: {}",
         snapshot.active_thread_id.as_deref().unwrap_or("(none)")
     );
@@ -383,15 +494,21 @@ fn render_status(snapshot: &SessionSnapshot, config: &Config) -> String {
     if let Some(turn_id) = snapshot.active_turn_id.as_deref() {
         let _ = writeln!(text, "turn_id: {turn_id}");
     }
+    if let Some(approval) = snapshot.pending_approval_message.as_deref() {
+        let _ = writeln!(text, "approval_pending: yes");
+        let _ = writeln!(text, "approval: {}", summarize_pending_approval(approval));
+    } else {
+        let _ = writeln!(text, "approval_pending: no");
+    }
     text.trim_end().to_string()
 }
 
 fn finalize_text(result: &TurnRunResult, last_rendered: &str) -> String {
-    if !result.assistant_text.trim().is_empty() {
-        return result.assistant_text.trim().to_string();
+    if !result.assistant_text.is_empty() {
+        return result.assistant_text.clone();
     }
-    if !last_rendered.trim().is_empty() {
-        return last_rendered.trim().to_string();
+    if !last_rendered.is_empty() {
+        return last_rendered.to_string();
     }
     if result.interrupted {
         return "Turn interrupted.".to_string();
@@ -400,6 +517,23 @@ fn finalize_text(result: &TurnRunResult, last_rendered: &str) -> String {
         return status.to_string();
     }
     "Turn completed with no assistant text.".to_string()
+}
+
+fn approval_acknowledgement(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Accept => "Approval accepted.",
+        ApprovalDecision::AcceptForSession => "Approval accepted for this session.",
+        ApprovalDecision::Decline => "Approval declined.",
+        ApprovalDecision::Cancel => "Approval cancelled.",
+    }
+}
+
+fn summarize_pending_approval(message: &str) -> String {
+    let line = message.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= 80 {
+        return line.to_string();
+    }
+    line.chars().take(80).collect::<String>() + "..."
 }
 
 #[cfg(test)]
@@ -418,6 +552,7 @@ mod tests {
             lock_path: PathBuf::from("bridge.lock"),
             codex_model: Some("gpt-5.4".to_string()),
             codex_approval_policy: "never".to_string(),
+            codex_sandbox_mode: None,
             poll_timeout_seconds: 30,
             update_limit: 50,
         }
@@ -456,5 +591,13 @@ mod tests {
     fn exits_after_three_poll_conflicts() {
         assert!(!should_exit_after_poll_conflicts(2));
         assert!(should_exit_after_poll_conflicts(3));
+    }
+
+    #[test]
+    fn summarize_pending_approval_uses_first_line() {
+        assert_eq!(
+            summarize_pending_approval("Codex approval required: command execution\ncommand: dir"),
+            "Codex approval required: command execution"
+        );
     }
 }

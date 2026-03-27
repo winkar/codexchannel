@@ -5,6 +5,8 @@ pub enum BotCommand {
     Use(String),
     Status,
     Stop,
+    Approve { for_session: bool },
+    Deny,
     Prompt(String),
     Invalid(String),
 }
@@ -24,6 +26,14 @@ impl BotCommand {
             "/new" => Self::New,
             "/status" => Self::Status,
             "/stop" => Self::Stop,
+            "/approve" => match rest {
+                "" => Self::Approve { for_session: false },
+                value if value.eq_ignore_ascii_case("session") => {
+                    Self::Approve { for_session: true }
+                }
+                _ => Self::Invalid(Self::help()),
+            },
+            "/deny" => Self::Deny,
             "/use" => {
                 if rest.is_empty() {
                     Self::Invalid(Self::help())
@@ -36,7 +46,7 @@ impl BotCommand {
     }
 
     pub fn help() -> String {
-        "/new\n/use <thread_id>\n/status\n/stop".to_string()
+        "/new\n/use <thread_id>\n/status\n/stop\n/approve [session]\n/deny".to_string()
     }
 }
 
@@ -68,6 +78,35 @@ mod tests {
     #[test]
     fn invalid_use_without_arg() {
         match BotCommand::parse("/use") {
+            BotCommand::Invalid(_) => {}
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_approve() {
+        assert_eq!(
+            BotCommand::parse("/approve"),
+            BotCommand::Approve { for_session: false }
+        );
+    }
+
+    #[test]
+    fn parses_approve_session() {
+        assert_eq!(
+            BotCommand::parse("/approve session"),
+            BotCommand::Approve { for_session: true }
+        );
+    }
+
+    #[test]
+    fn parses_deny() {
+        assert_eq!(BotCommand::parse("/deny"), BotCommand::Deny);
+    }
+
+    #[test]
+    fn invalid_approve_with_unknown_arg() {
+        match BotCommand::parse("/approve later") {
             BotCommand::Invalid(_) => {}
             other => panic!("expected invalid, got {other:?}"),
         }

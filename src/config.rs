@@ -16,6 +16,7 @@ pub struct Config {
     pub lock_path: PathBuf,
     pub codex_model: Option<String>,
     pub codex_approval_policy: String,
+    pub codex_sandbox_mode: Option<String>,
     pub poll_timeout_seconds: u64,
     pub update_limit: u32,
 }
@@ -30,6 +31,7 @@ struct FileConfig {
     lock_path: Option<PathBuf>,
     codex_model: Option<String>,
     codex_approval_policy: Option<String>,
+    codex_sandbox_mode: Option<String>,
     poll_timeout_seconds: Option<u64>,
     update_limit: Option<u32>,
 }
@@ -73,6 +75,10 @@ impl Config {
                 .ok()
                 .or(file_config.codex_approval_policy)
                 .unwrap_or_else(|| "never".to_string()),
+            codex_sandbox_mode: read_optional_sandbox_mode(
+                "CODEX_SANDBOX_MODE",
+                file_config.codex_sandbox_mode,
+            )?,
             poll_timeout_seconds: env::var("POLL_TIMEOUT_SECONDS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -120,6 +126,24 @@ fn read_path(name: &str, fallback: Option<PathBuf>) -> Result<PathBuf> {
         .map(PathBuf::from)
         .or(fallback)
         .ok_or_else(|| anyhow!("{name} is required"))
+}
+
+fn read_optional_sandbox_mode(name: &str, fallback: Option<String>) -> Result<Option<String>> {
+    let value = env::var(name).ok().or(fallback);
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| normalize_sandbox_mode(&value))
+        .transpose()
+}
+
+pub(crate) fn normalize_sandbox_mode(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "read-only" | "workspace-write" | "danger-full-access" => Ok(normalized),
+        _ => Err(anyhow!(
+            "invalid sandbox mode `{value}`; expected one of: read-only, workspace-write, danger-full-access"
+        )),
+    }
 }
 
 fn resolve_codex_binary(binary: PathBuf) -> PathBuf {
@@ -199,5 +223,25 @@ mod tests {
             candidates.first().unwrap(),
             &PathBuf::from(r"C:\Users\winka\AppData\Roaming\npm\codex.cmd")
         );
+    }
+
+    #[test]
+    fn normalizes_supported_sandbox_modes() {
+        assert_eq!(
+            normalize_sandbox_mode("Danger-Full-Access").expect("sandbox mode"),
+            "danger-full-access"
+        );
+        assert_eq!(
+            normalize_sandbox_mode("workspace-write").expect("sandbox mode"),
+            "workspace-write"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_sandbox_mode() {
+        let error = normalize_sandbox_mode("wide-open")
+            .expect_err("sandbox mode should be rejected")
+            .to_string();
+        assert!(error.contains("invalid sandbox mode"));
     }
 }

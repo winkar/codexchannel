@@ -3,8 +3,8 @@ mod codex;
 mod commands;
 mod config;
 mod logging;
-mod state;
 mod singleton;
+mod state;
 mod telegram;
 
 use anyhow::Result;

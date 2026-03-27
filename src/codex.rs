@@ -1,7 +1,9 @@
 use crate::logging;
+use crate::state::{ApprovalDecision, PendingApproval};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -9,7 +11,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     time::{Duration, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -20,15 +22,17 @@ pub struct CodexClient {
     cwd: PathBuf,
     model: Option<String>,
     approval_policy: String,
+    sandbox_mode: Option<String>,
     process: Arc<Mutex<Option<AppServerProcess>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum TurnEvent {
     ThreadReady(String),
     TurnStarted(String),
     AssistantDelta(String),
     Status(String),
+    ApprovalRequested(PendingApproval),
 }
 
 #[derive(Debug, Clone)]
@@ -79,12 +83,14 @@ impl CodexClient {
         cwd: PathBuf,
         model: Option<String>,
         approval_policy: String,
+        sandbox_mode: Option<String>,
     ) -> Self {
         Self {
             binary,
             cwd,
             model,
             approval_policy,
+            sandbox_mode,
             process: Arc::new(Mutex::new(None)),
         }
     }
@@ -96,28 +102,21 @@ impl CodexClient {
             self.cwd.display()
         ));
         let mut process_guard = self.process.lock().await;
-        ensure_process(
-            &mut process_guard,
-            &self.binary,
-            Duration::from_secs(10),
-        )
-        .await?;
+        ensure_process(&mut process_guard, &self.binary, Duration::from_secs(10)).await?;
         let request_id = match send_request_with_recovery(
             &mut process_guard,
             "thread/start",
-            json!({
-                "cwd": self.cwd.display().to_string(),
-                "model": self.model,
-                "approvalPolicy": self.approval_policy,
-                "experimentalRawEvents": false,
-                "persistExtendedHistory": false
-            }),
+            self.thread_start_params(),
         )
         .await
         {
             Ok(request_id) => request_id,
             Err(error) => {
-                reset_process_after_transport_error(&mut process_guard, &error, "thread/start request");
+                reset_process_after_transport_error(
+                    &mut process_guard,
+                    &error,
+                    "thread/start request",
+                );
                 return Err(error);
             }
         };
@@ -131,7 +130,11 @@ impl CodexClient {
         {
             Ok(response) => response,
             Err(error) => {
-                reset_process_after_transport_error(&mut process_guard, &error, "thread/start response");
+                reset_process_after_transport_error(
+                    &mut process_guard,
+                    &error,
+                    "thread/start response",
+                );
                 return Err(error);
             }
         };
@@ -162,34 +165,21 @@ impl CodexClient {
             self.cwd.display()
         ));
         let mut process_guard = self.process.lock().await;
-        ensure_process(
-            &mut process_guard,
-            &self.binary,
-            Duration::from_secs(10),
-        )
-        .await?;
+        ensure_process(&mut process_guard, &self.binary, Duration::from_secs(10)).await?;
         let request_id = match send_request_with_recovery(
             &mut process_guard,
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "cwd": self.cwd.display().to_string(),
-                "approvalPolicy": self.approval_policy,
-                "model": self.model,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": prompt,
-                        "text_elements": []
-                    }
-                ]
-            }),
+            self.turn_start_params(thread_id, prompt),
         )
         .await
         {
             Ok(request_id) => request_id,
             Err(error) => {
-                reset_process_after_transport_error(&mut process_guard, &error, "turn/start request");
+                reset_process_after_transport_error(
+                    &mut process_guard,
+                    &error,
+                    "turn/start request",
+                );
                 return Err(error);
             }
         };
@@ -283,6 +273,53 @@ impl CodexClient {
             last_status,
         })
     }
+
+    fn thread_start_params(&self) -> Value {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "cwd".to_string(),
+            Value::String(self.cwd.display().to_string()),
+        );
+        params.insert("model".to_string(), json!(self.model));
+        params.insert(
+            "approvalPolicy".to_string(),
+            Value::String(self.approval_policy.clone()),
+        );
+        params.insert("experimentalRawEvents".to_string(), Value::Bool(false));
+        params.insert("persistExtendedHistory".to_string(), Value::Bool(false));
+        if let Some(sandbox_mode) = &self.sandbox_mode {
+            params.insert("sandbox".to_string(), Value::String(sandbox_mode.clone()));
+        }
+        Value::Object(params)
+    }
+
+    fn turn_start_params(&self, thread_id: &str, prompt: &str) -> Value {
+        let mut params = serde_json::Map::new();
+        params.insert("threadId".to_string(), Value::String(thread_id.to_string()));
+        params.insert(
+            "cwd".to_string(),
+            Value::String(self.cwd.display().to_string()),
+        );
+        params.insert(
+            "approvalPolicy".to_string(),
+            Value::String(self.approval_policy.clone()),
+        );
+        params.insert("model".to_string(), json!(self.model));
+        params.insert(
+            "input".to_string(),
+            json!([
+                {
+                    "type": "text",
+                    "text": prompt,
+                    "text_elements": []
+                }
+            ]),
+        );
+        if let Some(sandbox_policy) = sandbox_policy_json(&self.cwd, self.sandbox_mode.as_deref()) {
+            params.insert("sandboxPolicy".to_string(), sandbox_policy);
+        }
+        Value::Object(params)
+    }
 }
 
 async fn ensure_process(
@@ -340,7 +377,9 @@ async fn await_response_with_timeout_and_recovery(
         .map_err(|_| anyhow!(timeout_message.to_string()))?
 }
 
-async fn next_message_with_recovery(process_guard: &mut Option<AppServerProcess>) -> Result<RpcMessage> {
+async fn next_message_with_recovery(
+    process_guard: &mut Option<AppServerProcess>,
+) -> Result<RpcMessage> {
     let process = process_guard
         .as_mut()
         .ok_or_else(|| anyhow!("codex app-server unavailable before reading next message"))?;
@@ -472,7 +511,7 @@ async fn handle_server_request<F, Fut>(
     process: &mut AppServerProcess,
     id: u64,
     method: &str,
-    _params: &Value,
+    params: &Value,
     on_event: &mut F,
 ) -> Result<()>
 where
@@ -481,22 +520,20 @@ where
 {
     match method {
         "item/commandExecution/requestApproval" => {
+            let (approval, receiver) = build_command_approval(params);
+            on_event(TurnEvent::ApprovalRequested(approval)).await?;
+            let decision = receiver.await.unwrap_or(ApprovalDecision::Cancel);
             process
-                .send_result(id, json!({"decision":"decline"}))
+                .send_result(id, approval_decision_json(decision))
                 .await?;
-            on_event(TurnEvent::Status(
-                "Codex requested command approval and it was declined.".to_string(),
-            ))
-            .await?;
         }
         "item/fileChange/requestApproval" => {
+            let (approval, receiver) = build_file_change_approval(params);
+            on_event(TurnEvent::ApprovalRequested(approval)).await?;
+            let decision = receiver.await.unwrap_or(ApprovalDecision::Cancel);
             process
-                .send_result(id, json!({"decision":"decline"}))
+                .send_result(id, approval_decision_json(decision))
                 .await?;
-            on_event(TurnEvent::Status(
-                "Codex requested file-change approval and it was declined.".to_string(),
-            ))
-            .await?;
         }
         "item/tool/requestUserInput" => {
             process.send_result(id, json!({"answers": {}})).await?;
@@ -520,7 +557,10 @@ where
 
 impl AppServerProcess {
     async fn spawn(binary: &Path) -> Result<Self> {
-        logging::info(&format!("spawning codex app-server via {}", binary.display()));
+        logging::info(&format!(
+            "spawning codex app-server via {}",
+            binary.display()
+        ));
         let mut child = spawnable_command(binary)
             .spawn()
             .with_context(|| format!("failed to spawn `{}`", binary.display()))?;
@@ -614,8 +654,8 @@ impl AppServerProcess {
             let Some(line) = self
                 .stdout
                 .next_line()
-            .await
-            .context("failed reading app-server stdout")?
+                .await
+                .context("failed reading app-server stdout")?
             else {
                 return Ok(None);
             };
@@ -702,6 +742,141 @@ fn parse_rpc_message(line: &str) -> Result<Option<RpcMessage>> {
     }))
 }
 
+fn sandbox_policy_json(cwd: &Path, sandbox_mode: Option<&str>) -> Option<Value> {
+    match sandbox_mode {
+        Some("danger-full-access") => Some(json!({
+            "type": "dangerFullAccess"
+        })),
+        Some("read-only") => Some(json!({
+            "type": "readOnly",
+            "access": {
+                "type": "fullAccess"
+            },
+            "networkAccess": false
+        })),
+        Some("workspace-write") => Some(json!({
+            "type": "workspaceWrite",
+            "writableRoots": [cwd.display().to_string()],
+            "readOnlyAccess": {
+                "type": "fullAccess"
+            },
+            "networkAccess": false,
+            "excludeTmpdirEnvVar": false,
+            "excludeSlashTmp": false
+        })),
+        _ => None,
+    }
+}
+
+fn build_command_approval(
+    params: &Value,
+) -> (PendingApproval, oneshot::Receiver<ApprovalDecision>) {
+    let allow_accept_for_session = params
+        .get("availableDecisions")
+        .and_then(Value::as_array)
+        .map(|decisions| {
+            decisions
+                .iter()
+                .any(|decision| decision.as_str() == Some("acceptForSession"))
+        })
+        .unwrap_or(false);
+
+    let mut message = String::from("Codex approval required: command execution");
+    push_optional_line(
+        &mut message,
+        "reason",
+        params.get("reason").and_then(Value::as_str),
+    );
+    push_optional_line(
+        &mut message,
+        "cwd",
+        params.get("cwd").and_then(Value::as_str),
+    );
+    push_optional_line(
+        &mut message,
+        "command",
+        params.get("command").and_then(Value::as_str),
+    );
+    append_approval_help(&mut message, allow_accept_for_session);
+    make_pending_approval(message, allow_accept_for_session)
+}
+
+fn build_file_change_approval(
+    params: &Value,
+) -> (PendingApproval, oneshot::Receiver<ApprovalDecision>) {
+    let mut message = String::from("Codex approval required: file change");
+    push_optional_line(
+        &mut message,
+        "reason",
+        params.get("reason").and_then(Value::as_str),
+    );
+    push_optional_line(
+        &mut message,
+        "grant_root",
+        params.get("grantRoot").and_then(Value::as_str),
+    );
+    append_approval_help(&mut message, true);
+    make_pending_approval(message, true)
+}
+
+fn make_pending_approval(
+    message: String,
+    allow_accept_for_session: bool,
+) -> (PendingApproval, oneshot::Receiver<ApprovalDecision>) {
+    let (sender, receiver) = oneshot::channel();
+    (
+        PendingApproval::new(
+            truncate_chars(&message, 3500),
+            allow_accept_for_session,
+            sender,
+        ),
+        receiver,
+    )
+}
+
+fn append_approval_help(message: &mut String, allow_accept_for_session: bool) {
+    if allow_accept_for_session {
+        let _ = write!(
+            message,
+            "\n\nReply with /approve, /approve session, or /deny."
+        );
+    } else {
+        let _ = write!(message, "\n\nReply with /approve or /deny.");
+    }
+}
+
+fn push_optional_line(message: &mut String, label: &str, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let _ = write!(message, "\n{}: {}", label, truncate_chars(value, 1200));
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    let mut chars = input.chars();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return input.to_string();
+        };
+        truncated.push(ch);
+    }
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn approval_decision_json(decision: ApprovalDecision) -> Value {
+    let encoded = match decision {
+        ApprovalDecision::Accept => "accept",
+        ApprovalDecision::AcceptForSession => "acceptForSession",
+        ApprovalDecision::Decline => "decline",
+        ApprovalDecision::Cancel => "cancel",
+    };
+    json!({ "decision": encoded })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,5 +941,23 @@ mod tests {
         let error = anyhow!("thread not found: abc | code -32600");
         assert!(!reset_slot_on_transport_error(&mut slot, &error));
         assert_eq!(slot, Some(123u32));
+    }
+
+    #[test]
+    fn sandbox_policy_uses_workspace_root() {
+        let policy = sandbox_policy_json(Path::new("C:/work"), Some("workspace-write"))
+            .expect("sandbox policy");
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(policy["writableRoots"][0], "C:/work");
+    }
+
+    #[test]
+    fn command_approval_detects_session_support() {
+        let (approval, _) = build_command_approval(&json!({
+            "command": "git status",
+            "availableDecisions": ["accept", "acceptForSession", "decline"]
+        }));
+        assert!(approval.allow_accept_for_session);
+        assert!(approval.message.contains("/approve session"));
     }
 }

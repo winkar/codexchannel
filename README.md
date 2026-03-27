@@ -7,6 +7,7 @@ This project is an MVP focused on one simple flow:
 - start a Codex thread from Telegram
 - send plain text prompts from Telegram
 - stream Codex output back by editing the same Telegram message
+- approve or deny Codex approval requests from Telegram
 - stop a running turn from Telegram
 
 ## Features
@@ -19,10 +20,11 @@ This project is an MVP focused on one simple flow:
   - `/use <thread_id>`
   - `/status`
   - `/stop`
+  - `/approve [session]`
+  - `/deny`
 - In-memory session state
-- Conservative approval handling:
-  - command execution approvals are declined
-  - file change approvals are declined
+- Telegram approval workflow for command execution and file-change requests
+- Configurable Codex sandbox mode
 
 ## Current Scope
 
@@ -33,7 +35,6 @@ This is intentionally limited:
 - no attachments
 - no database persistence
 - no group or forum topic support
-- no Telegram-side approval workflow
 
 ## Requirements
 
@@ -59,6 +60,8 @@ Optional:
 - `CODEX_MODEL`
 - `CODEX_APPROVAL_POLICY`
   - default: `never`
+- `CODEX_SANDBOX_MODE`
+  - supported values: `read-only`, `workspace-write`, `danger-full-access`
 - `LOG_PATH`
   - default: `bridge.log`
 - `LOCK_PATH`
@@ -79,6 +82,7 @@ codex_cwd = 'C:\Users\you\workspace'
 # codex_binary = "codex"
 # codex_model = "gpt-5.4"
 # codex_approval_policy = "never"
+# codex_sandbox_mode = "workspace-write"
 # log_path = "bridge.log"
 # lock_path = "bridge.lock"
 # poll_timeout_seconds = 30
@@ -90,6 +94,7 @@ Notes:
 - On Windows, prefer TOML literal strings for paths:
   - `codex_cwd = 'C:\Users\you\workspace'`
 - `CODEX_CWD` must already exist.
+- To approve actions from Telegram, set `CODEX_APPROVAL_POLICY` or `codex_approval_policy` to `on-request`, `on-failure`, or `untrusted`.
 
 ## Run
 
@@ -116,6 +121,12 @@ cargo build --release
   - show current thread, turn state, cwd, model, and approval policy
 - `/stop`
   - interrupt the current running turn
+- `/approve`
+  - approve the current pending request once
+- `/approve session`
+  - approve the current pending request for the current Codex session when supported
+- `/deny`
+  - decline the current pending request
 
 Any non-command text message is sent as a `turn/start` request to the current active thread.
 

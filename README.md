@@ -18,11 +18,13 @@ This project is an MVP focused on one simple flow:
 - Commands:
   - `/new`
   - `/use <thread_id>`
+  - `/cwd [path|index]`
   - `/status`
   - `/stop`
   - `/approve [session]`
   - `/deny`
 - In-memory session state
+- Imports recent working directories from local `~/.codex` session history at startup
 - Telegram approval workflow for command execution and file-change requests
 - Configurable Codex sandbox mode
 
@@ -118,7 +120,13 @@ cargo build --release
 - `/use <thread_id>`
   - switch to an existing thread id
 - `/status`
-  - show current thread, turn state, cwd, model, and approval policy
+  - show current thread, turn state, current cwd, cwd history, model, and approval policy
+- `/cwd`
+  - show the current working directory and remembered directory history
+- `/cwd <path>`
+  - switch to a different working directory and add it to history
+- `/cwd <index>`
+  - switch to a previously used working directory by history index
 - `/stop`
   - interrupt the current running turn
 - `/approve`
@@ -151,4 +159,4 @@ cargo build --release
 
 Latest GitHub release:
 
-- [`v0.1.1`](https://github.com/winkar/codexchannel/releases/tag/v0.1.1)
+- [`v0.1.2`](https://github.com/winkar/codexchannel/releases/tag/v0.1.2)

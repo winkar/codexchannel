@@ -7,7 +7,14 @@ use crate::{
     telegram::{TelegramClient, TelegramMessage, is_telegram_poll_conflict},
 };
 use anyhow::{Result, anyhow};
-use std::{fmt::Write as _, sync::Arc, time::Duration};
+use std::{
+    fmt::Write as _,
+    fs,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -27,10 +34,17 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Result<Self> {
+        let initial_cwd = config.codex_cwd.clone();
+        let imported_history = load_local_codex_cwd_history().unwrap_or_else(|error| {
+            logging::error(&format!(
+                "failed loading local codex cwd history: {error:#}"
+            ));
+            Vec::new()
+        });
         let telegram = TelegramClient::new(config.telegram_bot_token.clone())?;
         let codex = CodexClient::new(
             config.codex_binary.clone(),
-            config.codex_cwd.clone(),
+            initial_cwd.clone(),
             config.codex_model.clone(),
             config.codex_approval_policy.clone(),
             config.codex_sandbox_mode.clone(),
@@ -39,7 +53,7 @@ impl App {
             config: Arc::new(config),
             telegram,
             codex,
-            session: SharedSessionState::default(),
+            session: SharedSessionState::new_with_history(initial_cwd, imported_history),
         })
     }
 
@@ -197,6 +211,38 @@ impl App {
                         &format!("Switched to Codex thread:\n{thread_id}"),
                     )
                     .await?;
+            }
+            BotCommand::Cwd(argument) => {
+                if self.session.has_active_turn().await {
+                    self.telegram
+                        .send_message(message.chat.id, "A turn is running. Use /stop first.")
+                        .await?;
+                    return Ok(());
+                }
+
+                match argument {
+                    None => {
+                        let snapshot = self.session.snapshot().await;
+                        self.telegram
+                            .send_message(message.chat.id, &render_cwd_history(&snapshot))
+                            .await?;
+                    }
+                    Some(argument) => {
+                        let cwd = self.resolve_requested_cwd(&argument).await?;
+                        self.codex.set_cwd(cwd.clone()).await;
+                        self.session.set_active_cwd(cwd.clone()).await;
+                        self.telegram
+                            .send_message(
+                                message.chat.id,
+                                &format!(
+                                    "Switched working directory to:\n{}\n\n{}",
+                                    cwd.display(),
+                                    render_cwd_history(&self.session.snapshot().await)
+                                ),
+                            )
+                            .await?;
+                    }
+                }
             }
             BotCommand::Status => {
                 logging::info("handling /status");
@@ -409,6 +455,7 @@ impl App {
                 "Telegram Codex Bridge\n\n",
                 "/new - start a new Codex thread\n",
                 "/use <thread_id> - switch active thread\n",
+                "/cwd [path|index] - show or switch working directory\n",
                 "/status - show current state\n",
                 "/stop - interrupt running turn\n",
                 "/approve [session] - approve pending action\n",
@@ -533,7 +580,15 @@ fn should_exit_after_poll_conflicts(consecutive: u32) -> bool {
 fn render_status(snapshot: &SessionSnapshot, config: &Config) -> String {
     let mut text = String::new();
     let _ = writeln!(text, "Current status");
-    let _ = writeln!(text, "cwd: {}", config.codex_cwd.display());
+    let _ = writeln!(
+        text,
+        "cwd: {}",
+        snapshot
+            .active_cwd
+            .as_deref()
+            .unwrap_or(config.codex_cwd.as_path())
+            .display()
+    );
     let _ = writeln!(
         text,
         "model: {}",
@@ -568,7 +623,131 @@ fn render_status(snapshot: &SessionSnapshot, config: &Config) -> String {
     } else {
         let _ = writeln!(text, "approval_pending: no");
     }
+    if !snapshot.cwd_history.is_empty() {
+        let _ = writeln!(text, "cwd_history:");
+        for (index, path) in snapshot.cwd_history.iter().enumerate() {
+            let _ = writeln!(text, "  {index}: {}", path.display());
+        }
+    }
     text.trim_end().to_string()
+}
+
+fn render_cwd_history(snapshot: &SessionSnapshot) -> String {
+    let mut text = String::new();
+    let current = snapshot
+        .active_cwd
+        .as_deref()
+        .map(Path::display)
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+    let _ = writeln!(text, "Current working directory");
+    let _ = writeln!(text, "{current}");
+    if !snapshot.cwd_history.is_empty() {
+        let _ = writeln!(text);
+        let _ = writeln!(text, "History");
+        for (index, path) in snapshot.cwd_history.iter().enumerate() {
+            let _ = writeln!(text, "{index}: {}", path.display());
+        }
+    }
+    text.trim_end().to_string()
+}
+
+fn load_local_codex_cwd_history() -> Result<Vec<PathBuf>> {
+    let Some(codex_home) = codex_home_dir() else {
+        return Ok(Vec::new());
+    };
+
+    let mut sessions = Vec::new();
+    collect_rollout_files(&codex_home.join("sessions"), &mut sessions)?;
+    collect_rollout_files(&codex_home.join("archived_sessions"), &mut sessions)?;
+    sessions.sort_by(|left, right| right.cmp(left));
+
+    let mut history = Vec::new();
+    for path in sessions {
+        if let Some(cwd) = read_session_cwd(&path)? {
+            if cwd.is_dir() && !history.iter().any(|entry| entry == &cwd) {
+                history.push(cwd);
+            }
+        }
+    }
+    Ok(history)
+}
+
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_rollout_files(&path, files)?;
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_session_cwd(path: &Path) -> Result<Option<PathBuf>> {
+    let file = fs::File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let Some(first_line) = lines.next().transpose()? else {
+        return Ok(None);
+    };
+
+    let record: serde_json::Value = serde_json::from_str(&first_line)?;
+    Ok(record
+        .get("payload")
+        .and_then(|payload| payload.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from))
+}
+
+impl App {
+    async fn resolve_requested_cwd(&self, input: &str) -> Result<PathBuf> {
+        if let Ok(index) = input.parse::<usize>() {
+            return self
+                .session
+                .resolve_cwd_history_entry(index)
+                .await
+                .ok_or_else(|| anyhow!("No working directory found at history index {index}."));
+        }
+
+        let path = PathBuf::from(input);
+        let normalized = if path.is_absolute() {
+            path
+        } else {
+            let base = self
+                .session
+                .active_cwd()
+                .await
+                .unwrap_or_else(|| self.config.codex_cwd.clone());
+            base.join(path)
+        };
+
+        if !normalized.is_dir() {
+            return Err(anyhow!(
+                "Working directory does not exist or is not a directory:\n{}",
+                normalized.display()
+            ));
+        }
+        Ok(normalized)
+    }
 }
 
 fn finalize_text(result: &TurnRunResult, last_rendered: &str) -> String {
@@ -609,6 +788,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     fn sample_config() -> Config {
         Config {
@@ -650,9 +830,89 @@ mod tests {
     async fn render_status_shows_thread() {
         let session = SharedSessionState::default();
         session.set_active_thread("thread-123".to_string()).await;
+        session.set_active_cwd(PathBuf::from("C:/work")).await;
         let snapshot = session.snapshot().await;
         let text = render_status(&snapshot, &sample_config());
         assert!(text.contains("thread-123"));
+    }
+
+    #[tokio::test]
+    async fn render_cwd_history_lists_indexes() {
+        let session = SharedSessionState::default();
+        session.set_active_cwd(PathBuf::from("C:/one")).await;
+        session.set_active_cwd(PathBuf::from("C:/two")).await;
+        let snapshot = session.snapshot().await;
+        let text = render_cwd_history(&snapshot);
+        assert!(text.contains("0: C:/two"));
+        assert!(text.contains("1: C:/one"));
+    }
+
+    #[test]
+    fn loads_local_codex_cwd_history_from_rollouts() {
+        let temp = tempdir().expect("tempdir");
+        let sessions_root = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("03")
+            .join("27");
+        fs::create_dir_all(&sessions_root).expect("create sessions dir");
+        let older_cwd = temp.path().join("older");
+        let newer_cwd = temp.path().join("newer");
+        fs::create_dir_all(&older_cwd).expect("create older cwd");
+        fs::create_dir_all(&newer_cwd).expect("create newer cwd");
+
+        fs::write(
+            sessions_root.join("rollout-2026-03-27T07-31-08-older.jsonl"),
+            serde_json::json!({
+                "timestamp": "2026-03-27T07:31:08.611Z",
+                "type": "session_meta",
+                "payload": { "cwd": older_cwd.display().to_string() }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write older");
+        fs::write(
+            sessions_root.join("rollout-2026-03-27T08-31-08-newer.jsonl"),
+            serde_json::json!({
+                "timestamp": "2026-03-27T08:31:08.611Z",
+                "type": "session_meta",
+                "payload": { "cwd": newer_cwd.display().to_string() }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write newer");
+        fs::write(
+            sessions_root.join("rollout-2026-03-27T09-31-08-duplicate.jsonl"),
+            serde_json::json!({
+                "timestamp": "2026-03-27T09:31:08.611Z",
+                "type": "session_meta",
+                "payload": { "cwd": newer_cwd.display().to_string() }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write duplicate");
+
+        let files = {
+            let mut files = Vec::new();
+            collect_rollout_files(temp.path().join("sessions").as_path(), &mut files)
+                .expect("collect rollout files");
+            files.sort_by(|left, right| right.cmp(left));
+            files
+        };
+
+        let mut history = Vec::new();
+        for path in files {
+            if let Some(cwd) = read_session_cwd(&path).expect("read session cwd") {
+                if !history.iter().any(|entry| entry == &cwd) {
+                    history.push(cwd);
+                }
+            }
+        }
+        assert_eq!(history, vec![newer_cwd, older_cwd]);
     }
 
     #[test]

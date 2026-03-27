@@ -3,6 +3,7 @@ pub enum BotCommand {
     Start,
     New,
     Use(String),
+    Cwd(Option<String>),
     Status,
     Stop,
     Approve { for_session: bool },
@@ -24,6 +25,13 @@ impl BotCommand {
         match command {
             "/start" => Self::Start,
             "/new" => Self::New,
+            "/cwd" => {
+                if rest.is_empty() {
+                    Self::Cwd(None)
+                } else {
+                    Self::Cwd(Some(rest.to_string()))
+                }
+            }
             "/status" => Self::Status,
             "/stop" => Self::Stop,
             "/approve" => match rest {
@@ -46,7 +54,8 @@ impl BotCommand {
     }
 
     pub fn help() -> String {
-        "/new\n/use <thread_id>\n/status\n/stop\n/approve [session]\n/deny".to_string()
+        "/new\n/use <thread_id>\n/cwd [path|index]\n/status\n/stop\n/approve [session]\n/deny"
+            .to_string()
     }
 }
 
@@ -64,6 +73,19 @@ mod tests {
         assert_eq!(
             BotCommand::parse("/use thread-123"),
             BotCommand::Use("thread-123".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_cwd_without_arg() {
+        assert_eq!(BotCommand::parse("/cwd"), BotCommand::Cwd(None));
+    }
+
+    #[test]
+    fn parses_cwd_with_arg() {
+        assert_eq!(
+            BotCommand::parse("/cwd 2"),
+            BotCommand::Cwd(Some("2".to_string()))
         );
     }
 

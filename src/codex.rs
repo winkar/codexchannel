@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct CodexClient {
     binary: PathBuf,
-    cwd: PathBuf,
+    cwd: Arc<Mutex<PathBuf>>,
     model: Option<String>,
     approval_policy: String,
     sandbox_mode: Option<String>,
@@ -87,7 +87,7 @@ impl CodexClient {
     ) -> Self {
         Self {
             binary,
-            cwd,
+            cwd: Arc::new(Mutex::new(cwd)),
             model,
             approval_policy,
             sandbox_mode,
@@ -95,18 +95,27 @@ impl CodexClient {
         }
     }
 
+    pub async fn cwd(&self) -> PathBuf {
+        self.cwd.lock().await.clone()
+    }
+
+    pub async fn set_cwd(&self, cwd: PathBuf) {
+        *self.cwd.lock().await = cwd;
+    }
+
     pub async fn start_thread(&self) -> Result<String> {
+        let cwd = self.cwd().await;
         logging::info(&format!(
             "codex start_thread begin binary={} cwd={}",
             self.binary.display(),
-            self.cwd.display()
+            cwd.display()
         ));
         let mut process_guard = self.process.lock().await;
         ensure_process(&mut process_guard, &self.binary, Duration::from_secs(10)).await?;
         let request_id = match send_request_with_recovery(
             &mut process_guard,
             "thread/start",
-            self.thread_start_params(),
+            self.thread_start_params(&cwd),
         )
         .await
         {
@@ -159,17 +168,18 @@ impl CodexClient {
         F: FnMut(TurnEvent) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        let cwd = self.cwd().await;
         logging::info(&format!(
             "codex run_turn begin thread_id={} cwd={}",
             thread_id,
-            self.cwd.display()
+            cwd.display()
         ));
         let mut process_guard = self.process.lock().await;
         ensure_process(&mut process_guard, &self.binary, Duration::from_secs(10)).await?;
         let request_id = match send_request_with_recovery(
             &mut process_guard,
             "turn/start",
-            self.turn_start_params(thread_id, prompt),
+            self.turn_start_params(thread_id, prompt, &cwd),
         )
         .await
         {
@@ -274,12 +284,9 @@ impl CodexClient {
         })
     }
 
-    fn thread_start_params(&self) -> Value {
+    fn thread_start_params(&self, cwd: &Path) -> Value {
         let mut params = serde_json::Map::new();
-        params.insert(
-            "cwd".to_string(),
-            Value::String(self.cwd.display().to_string()),
-        );
+        params.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
         params.insert("model".to_string(), json!(self.model));
         params.insert(
             "approvalPolicy".to_string(),
@@ -293,13 +300,10 @@ impl CodexClient {
         Value::Object(params)
     }
 
-    fn turn_start_params(&self, thread_id: &str, prompt: &str) -> Value {
+    fn turn_start_params(&self, thread_id: &str, prompt: &str, cwd: &Path) -> Value {
         let mut params = serde_json::Map::new();
         params.insert("threadId".to_string(), Value::String(thread_id.to_string()));
-        params.insert(
-            "cwd".to_string(),
-            Value::String(self.cwd.display().to_string()),
-        );
+        params.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
         params.insert(
             "approvalPolicy".to_string(),
             Value::String(self.approval_policy.clone()),
@@ -315,7 +319,7 @@ impl CodexClient {
                 }
             ]),
         );
-        if let Some(sandbox_policy) = sandbox_policy_json(&self.cwd, self.sandbox_mode.as_deref()) {
+        if let Some(sandbox_policy) = sandbox_policy_json(cwd, self.sandbox_mode.as_deref()) {
             params.insert("sandboxPolicy".to_string(), sandbox_policy);
         }
         Value::Object(params)
@@ -513,10 +517,7 @@ fn merge_assistant_text(assistant_text: &mut String, text: &str) {
         return;
     }
 
-    if assistant_text == text
-        || assistant_text.ends_with(text)
-        || assistant_text.contains(text)
-    {
+    if assistant_text == text || assistant_text.ends_with(text) || assistant_text.contains(text) {
         return;
     }
 

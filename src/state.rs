@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{
     sync::{Mutex, oneshot},
@@ -43,6 +44,8 @@ pub struct SessionSnapshot {
     pub active_thread_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub active_turn_running: bool,
+    pub active_cwd: Option<PathBuf>,
+    pub cwd_history: Vec<PathBuf>,
     pub pending_approval_message: Option<String>,
     pub pending_approval_supports_session: bool,
 }
@@ -54,6 +57,8 @@ pub struct SessionState {
     active_turn_cancel: Option<CancellationToken>,
     active_turn_task: Option<JoinHandle<()>>,
     pending_approval: Option<PendingApproval>,
+    active_cwd: Option<PathBuf>,
+    cwd_history: Vec<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -62,12 +67,26 @@ pub struct SharedSessionState {
 }
 
 impl SharedSessionState {
+    pub fn new_with_history(cwd: PathBuf, history: Vec<PathBuf>) -> Self {
+        let mut state = SessionState::default();
+        for path in history.into_iter().rev() {
+            record_cwd_history(&mut state.cwd_history, &path);
+        }
+        record_cwd_history(&mut state.cwd_history, &cwd);
+        state.active_cwd = Some(cwd);
+        Self {
+            inner: Arc::new(Mutex::new(state)),
+        }
+    }
+
     pub async fn snapshot(&self) -> SessionSnapshot {
         let guard = self.inner.lock().await;
         SessionSnapshot {
             active_thread_id: guard.active_thread_id.clone(),
             active_turn_id: guard.active_turn_id.clone(),
             active_turn_running: guard.active_turn_cancel.is_some(),
+            active_cwd: guard.active_cwd.clone(),
+            cwd_history: guard.cwd_history.clone(),
             pending_approval_message: guard
                 .pending_approval
                 .as_ref()
@@ -86,6 +105,20 @@ impl SharedSessionState {
 
     pub async fn set_active_thread(&self, thread_id: String) {
         self.inner.lock().await.active_thread_id = Some(thread_id);
+    }
+
+    pub async fn active_cwd(&self) -> Option<PathBuf> {
+        self.inner.lock().await.active_cwd.clone()
+    }
+
+    pub async fn set_active_cwd(&self, cwd: PathBuf) {
+        let mut guard = self.inner.lock().await;
+        record_cwd_history(&mut guard.cwd_history, &cwd);
+        guard.active_cwd = Some(cwd);
+    }
+
+    pub async fn resolve_cwd_history_entry(&self, index: usize) -> Option<PathBuf> {
+        self.inner.lock().await.cwd_history.get(index).cloned()
     }
 
     pub async fn set_active_turn_id(&self, turn_id: String) {
@@ -144,9 +177,15 @@ impl SharedSessionState {
     }
 }
 
+fn record_cwd_history(history: &mut Vec<PathBuf>, cwd: &Path) {
+    history.retain(|entry| entry != cwd);
+    history.insert(0, cwd.to_path_buf());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn set_and_clear_turn() {
@@ -212,6 +251,21 @@ mod tests {
         assert_eq!(
             receiver_two.await.expect("decision"),
             ApprovalDecision::AcceptForSession
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_history_tracks_most_recent_first() {
+        let state = SharedSessionState::default();
+        state.set_active_cwd(PathBuf::from("C:/one")).await;
+        state.set_active_cwd(PathBuf::from("C:/two")).await;
+        state.set_active_cwd(PathBuf::from("C:/one")).await;
+
+        let snapshot = state.snapshot().await;
+        assert_eq!(snapshot.active_cwd, Some(PathBuf::from("C:/one")));
+        assert_eq!(
+            snapshot.cwd_history,
+            vec![PathBuf::from("C:/one"), PathBuf::from("C:/two")]
         );
     }
 }

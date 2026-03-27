@@ -73,12 +73,14 @@ impl App {
             .from
             .as_ref()
             .ok_or_else(|| anyhow!("telegram message missing from field"))?;
-        if from.id != self.config.telegram_allowed_user_id {
-            let _ = self
-                .telegram
-                .send_message(message.chat.id, "Unauthorized user.")
-                .await;
-            return Ok(());
+        if let Some(allowed_user_id) = self.config.telegram_allowed_user_id {
+            if from.id != allowed_user_id {
+                let _ = self
+                    .telegram
+                    .send_message(message.chat.id, "Unauthorized user.")
+                    .await;
+                return Ok(());
+            }
         }
 
         let text = message.text.as_deref().unwrap_or("").trim();
@@ -327,7 +329,7 @@ mod tests {
     fn sample_config() -> Config {
         Config {
             telegram_bot_token: "token".to_string(),
-            telegram_allowed_user_id: 1,
+            telegram_allowed_user_id: Some(1),
             codex_binary: PathBuf::from("codex"),
             codex_cwd: PathBuf::from("C:/work"),
             codex_model: Some("gpt-5.4".to_string()),

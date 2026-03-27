@@ -5,7 +5,7 @@ use std::{env, fs, path::PathBuf};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub telegram_bot_token: String,
-    pub telegram_allowed_user_id: i64,
+    pub telegram_allowed_user_id: Option<i64>,
     pub codex_binary: PathBuf,
     pub codex_cwd: PathBuf,
     pub codex_model: Option<String>,
@@ -28,9 +28,9 @@ struct FileConfig {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let file_config = load_file_config().unwrap_or_default();
+        let file_config = load_file_config()?;
         let telegram_bot_token = read_string("TELEGRAM_BOT_TOKEN", file_config.telegram_bot_token)?;
-        let telegram_allowed_user_id = read_i64(
+        let telegram_allowed_user_id = read_optional_i64(
             "TELEGRAM_ALLOWED_USER_ID",
             file_config.telegram_allowed_user_id,
         )?;
@@ -87,13 +87,14 @@ fn read_string(name: &str, fallback: Option<String>) -> Result<String> {
         .ok_or_else(|| anyhow!("{name} is required"))
 }
 
-fn read_i64(name: &str, fallback: Option<i64>) -> Result<i64> {
+fn read_optional_i64(name: &str, fallback: Option<i64>) -> Result<Option<i64>> {
     if let Ok(value) = env::var(name) {
         return value
             .parse::<i64>()
+            .map(Some)
             .with_context(|| format!("{name} must be an integer"));
     }
-    fallback.ok_or_else(|| anyhow!("{name} is required"))
+    Ok(fallback)
 }
 
 fn read_path(name: &str, fallback: Option<PathBuf>) -> Result<PathBuf> {

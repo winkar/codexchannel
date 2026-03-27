@@ -8,8 +8,14 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use std::{fmt::Write as _, sync::Arc, time::Duration};
-use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+    time::{Instant, sleep, sleep_until},
+};
 use tokio_util::sync::CancellationToken;
+
+const TELEGRAM_EDIT_THROTTLE: Duration = Duration::from_millis(400);
 
 #[derive(Clone)]
 pub struct App {
@@ -316,28 +322,24 @@ impl App {
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
         let app = self.clone();
-        let last_rendered = Arc::new(Mutex::new(String::new()));
+        let progress = ProgressRenderer::new(self.telegram.clone(), chat_id, message_id);
+        let render_task = tokio::spawn(progress.clone().run());
         tokio::spawn(async move {
             let result = app
-                .run_turn(
-                    chat_id,
-                    thread_id,
-                    prompt,
-                    message_id,
-                    cancel,
-                    last_rendered.clone(),
-                )
+                .run_turn(chat_id, thread_id, prompt, cancel, progress.clone())
                 .await;
             if let Err(error) = result {
                 logging::error(&format!("turn failed: {error:#}"));
-                let _ = app
-                    .render_progress_message(
-                        chat_id,
-                        message_id,
-                        &last_rendered,
-                        &format!("Turn failed:\n{error:#}"),
-                    )
-                    .await;
+                progress.finish(&format!("Turn failed:\n{error:#}")).await;
+            }
+            match render_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    logging::error(&format!("progress render failed: {error:#}"));
+                }
+                Err(error) => {
+                    logging::error(&format!("progress render task join failed: {error}"));
+                }
             }
             app.session.clear_active_turn().await;
         })
@@ -348,9 +350,8 @@ impl App {
         chat_id: i64,
         thread_id: String,
         prompt: String,
-        message_id: i64,
         cancel: CancellationToken,
-        last_rendered: Arc<Mutex<String>>,
+        progress: ProgressRenderer,
     ) -> Result<()> {
         logging::info(&format!("starting turn for thread {thread_id}"));
         let result = self
@@ -358,8 +359,7 @@ impl App {
             .run_turn(&thread_id, &prompt, cancel, |event| {
                 let session = self.session.clone();
                 let telegram = self.telegram.clone();
-                let app = self.clone();
-                let last_rendered = last_rendered.clone();
+                let progress = progress.clone();
                 async move {
                     match event {
                         TurnEvent::ThreadReady(thread_id) => {
@@ -369,32 +369,19 @@ impl App {
                             session.set_active_turn_id(turn_id).await;
                         }
                         TurnEvent::AssistantDelta(text) => {
-                            app.render_progress_message(chat_id, message_id, &last_rendered, &text)
-                                .await?;
+                            progress.update(&text).await;
                         }
                         TurnEvent::Status(text) => {
-                            let current = last_rendered.lock().await.clone();
+                            let current = progress.current_text().await;
                             if current.is_empty() {
-                                app.render_progress_message(
-                                    chat_id,
-                                    message_id,
-                                    &last_rendered,
-                                    &text,
-                                )
-                                .await?;
+                                progress.update(&text).await;
                             }
                         }
                         TurnEvent::ApprovalRequested(approval) => {
                             let approval_message = approval.message.clone();
                             session.set_pending_approval(approval).await;
-                            if last_rendered.lock().await.is_empty() {
-                                app.render_progress_message(
-                                    chat_id,
-                                    message_id,
-                                    &last_rendered,
-                                    "Waiting for approval...",
-                                )
-                                .await?;
+                            if progress.current_text().await.is_empty() {
+                                progress.update("Waiting for approval...").await;
                             }
                             telegram.send_message(chat_id, &approval_message).await?;
                         }
@@ -403,7 +390,7 @@ impl App {
                 }
             })
             .await?;
-        let final_cache = last_rendered.lock().await.clone();
+        let final_cache = progress.current_text().await;
         let final_text = finalize_text(&result, &final_cache);
         logging::info(&format!(
             "turn completed for thread {} interrupted={} final_len={}",
@@ -411,14 +398,7 @@ impl App {
             result.interrupted,
             final_text.len()
         ));
-        if self
-            .render_progress_message(chat_id, message_id, &last_rendered, &final_text)
-            .await?
-        {
-            logging::info("rendered final telegram edit");
-        } else {
-            logging::info("skipping final telegram edit because content is unchanged");
-        }
+        progress.finish(&final_text).await;
         Ok(())
     }
 
@@ -438,23 +418,111 @@ impl App {
             render_status(&snapshot, &self.config)
         )
     }
+}
 
-    async fn render_progress_message(
-        &self,
-        chat_id: i64,
-        message_id: i64,
-        last_rendered: &Arc<Mutex<String>>,
-        text: &str,
-    ) -> Result<bool> {
-        let mut current = last_rendered.lock().await;
-        if text == *current {
-            return Ok(false);
+#[derive(Clone)]
+struct ProgressRenderer {
+    inner: Arc<ProgressRendererInner>,
+}
+
+struct ProgressRendererInner {
+    telegram: TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    notify: Notify,
+    state: Mutex<ProgressState>,
+}
+
+#[derive(Default)]
+struct ProgressState {
+    desired: String,
+    rendered: String,
+    closed: bool,
+}
+
+impl ProgressRenderer {
+    fn new(telegram: TelegramClient, chat_id: i64, message_id: i64) -> Self {
+        Self {
+            inner: Arc::new(ProgressRendererInner {
+                telegram,
+                chat_id,
+                message_id,
+                notify: Notify::new(),
+                state: Mutex::new(ProgressState::default()),
+            }),
         }
-        self.telegram
-            .edit_message(chat_id, message_id, text)
-            .await?;
-        *current = text.to_string();
-        Ok(true)
+    }
+
+    async fn update(&self, text: &str) {
+        let mut state = self.inner.state.lock().await;
+        if state.closed || state.desired == text {
+            return;
+        }
+        state.desired = text.to_string();
+        drop(state);
+        self.inner.notify.notify_one();
+    }
+
+    async fn finish(&self, text: &str) {
+        let mut state = self.inner.state.lock().await;
+        state.desired = text.to_string();
+        state.closed = true;
+        drop(state);
+        self.inner.notify.notify_one();
+    }
+
+    async fn current_text(&self) -> String {
+        let state = self.inner.state.lock().await;
+        if state.desired.is_empty() {
+            state.rendered.clone()
+        } else {
+            state.desired.clone()
+        }
+    }
+
+    async fn run(self) -> Result<()> {
+        let mut next_allowed = Instant::now();
+        loop {
+            let snapshot = {
+                let state = self.inner.state.lock().await;
+                (state.desired.clone(), state.rendered.clone(), state.closed)
+            };
+            let (desired, rendered, closed) = snapshot;
+
+            if desired == rendered {
+                if closed {
+                    logging::info("skipping final telegram edit because content is unchanged");
+                    return Ok(());
+                }
+                self.inner.notify.notified().await;
+                continue;
+            }
+
+            let now = Instant::now();
+            let can_render_now = rendered.is_empty() || closed || now >= next_allowed;
+            if !can_render_now {
+                tokio::select! {
+                    _ = sleep_until(next_allowed) => {}
+                    _ = self.inner.notify.notified() => {}
+                }
+                continue;
+            }
+
+            self.inner
+                .telegram
+                .edit_message(self.inner.chat_id, self.inner.message_id, &desired)
+                .await?;
+            let mut state = self.inner.state.lock().await;
+            state.rendered = desired.clone();
+            let done = state.closed && state.rendered == state.desired;
+            drop(state);
+            next_allowed = Instant::now() + TELEGRAM_EDIT_THROTTLE;
+
+            if done {
+                logging::info("rendered final telegram edit");
+                return Ok(());
+            }
+        }
     }
 }
 

@@ -477,7 +477,7 @@ where
             if let Some(item) = params.get("item") {
                 if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                     if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        *assistant_text = text.to_string();
+                        merge_assistant_text(assistant_text, text);
                         on_event(TurnEvent::AssistantDelta(assistant_text.clone())).await?;
                     }
                 } else if item.get("type").and_then(Value::as_str) == Some("commandExecution") {
@@ -505,6 +505,25 @@ where
         _ => {}
     }
     Ok(())
+}
+
+fn merge_assistant_text(assistant_text: &mut String, text: &str) {
+    if assistant_text.is_empty() || text.starts_with(assistant_text.as_str()) {
+        *assistant_text = text.to_string();
+        return;
+    }
+
+    if assistant_text == text
+        || assistant_text.ends_with(text)
+        || assistant_text.contains(text)
+    {
+        return;
+    }
+
+    if !assistant_text.ends_with('\n') {
+        assistant_text.push_str("\n\n");
+    }
+    assistant_text.push_str(text);
 }
 
 async fn handle_server_request<F, Fut>(
@@ -925,6 +944,28 @@ mod tests {
         .await
         .expect("notification");
         assert_eq!(assistant, "hello");
+    }
+
+    #[tokio::test]
+    async fn completed_agent_message_keeps_existing_output() {
+        let mut assistant = "first answer".to_string();
+        let mut turn_started = None;
+        let mut done = false;
+        let mut interrupted = false;
+        let mut last_status = None;
+        handle_notification(
+            "item/completed",
+            &json!({"item":{"type":"agentMessage","text":"second answer"}}),
+            &mut assistant,
+            &mut turn_started,
+            &mut done,
+            &mut interrupted,
+            &mut last_status,
+            &mut |_| async { Ok(()) },
+        )
+        .await
+        .expect("notification");
+        assert_eq!(assistant, "first answer\n\nsecond answer");
     }
 
     #[test]

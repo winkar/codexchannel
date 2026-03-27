@@ -29,7 +29,7 @@ pub struct App {
     config: Arc<Config>,
     telegram: TelegramClient,
     codex: CodexClient,
-    session: SharedSessionState,
+    pub session: SharedSessionState,
 }
 
 impl App {

@@ -4,3 +4,15 @@ bridge.toml
 workspace
 bridge.log
 bridge.lock
+
+# Tauri / Rust backend build artefacts
+src-tauri/target/
+
+# Frontend build artefacts
+node_modules/
+
+# Generated icon source (recreated via `cargo tauri icon`)
+app-icon.png
+
+# Local assistant/tooling state
+.claude/

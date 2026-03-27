@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for Telegram Codex Bridge","local":true,"windows":["main"],"permissions":["core:default","autostart:allow-enable","autostart:allow-disable","autostart:allow-is-enabled","shell:default"]}}

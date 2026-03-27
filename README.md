@@ -59,6 +59,10 @@ Optional:
 - `CODEX_MODEL`
 - `CODEX_APPROVAL_POLICY`
   - default: `never`
+- `LOG_PATH`
+  - default: `bridge.log`
+- `LOCK_PATH`
+  - default: `bridge.lock`
 - `POLL_TIMEOUT_SECONDS`
   - default: `30`
 - `UPDATE_LIMIT`
@@ -75,6 +79,8 @@ codex_cwd = 'C:\Users\you\workspace'
 # codex_binary = "codex"
 # codex_model = "gpt-5.4"
 # codex_approval_policy = "never"
+# log_path = "bridge.log"
+# lock_path = "bridge.lock"
 # poll_timeout_seconds = 30
 # update_limit = 50
 ```
@@ -132,6 +138,6 @@ cargo build --release
 
 ## Release
 
-The first GitHub release is:
+Latest GitHub release:
 
-- [`v0.1.0`](https://github.com/winkar/codexchannel/releases/tag/v0.1.0)
+- [`v0.1.1`](https://github.com/winkar/codexchannel/releases/tag/v0.1.1)

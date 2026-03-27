@@ -2,3 +2,5 @@
 dist
 bridge.toml
 workspace
+bridge.log
+bridge.lock

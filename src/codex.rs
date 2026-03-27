@@ -1,3 +1,4 @@
+use crate::logging;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
@@ -9,6 +10,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
+    time::{Duration, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +20,7 @@ pub struct CodexClient {
     cwd: PathBuf,
     model: Option<String>,
     approval_policy: String,
+    process: Arc<Mutex<Option<AppServerProcess>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +42,6 @@ pub struct AppServerProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
-    stderr: Arc<Mutex<String>>,
     stderr_task: tokio::task::JoinHandle<()>,
     next_id: u64,
 }
@@ -83,32 +85,63 @@ impl CodexClient {
             cwd,
             model,
             approval_policy,
+            process: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn start_thread(&self) -> Result<String> {
-        let mut process = AppServerProcess::spawn(&self.binary).await?;
-        process.initialize().await?;
-        let request_id = process
-            .send_request(
-                "thread/start",
-                json!({
-                    "cwd": self.cwd.display().to_string(),
-                    "model": self.model,
-                    "approvalPolicy": self.approval_policy,
-                    "experimentalRawEvents": false,
-                    "persistExtendedHistory": false
-                }),
-            )
-            .await?;
-        let response = process.await_response(request_id).await?;
+        logging::info(&format!(
+            "codex start_thread begin binary={} cwd={}",
+            self.binary.display(),
+            self.cwd.display()
+        ));
+        let mut process_guard = self.process.lock().await;
+        ensure_process(
+            &mut process_guard,
+            &self.binary,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let request_id = match send_request_with_recovery(
+            &mut process_guard,
+            "thread/start",
+            json!({
+                "cwd": self.cwd.display().to_string(),
+                "model": self.model,
+                "approvalPolicy": self.approval_policy,
+                "experimentalRawEvents": false,
+                "persistExtendedHistory": false
+            }),
+        )
+        .await
+        {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                reset_process_after_transport_error(&mut process_guard, &error, "thread/start request");
+                return Err(error);
+            }
+        };
+        let response = match await_response_with_timeout_and_recovery(
+            &mut process_guard,
+            request_id,
+            Duration::from_secs(45),
+            "timed out waiting for codex thread/start",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                reset_process_after_transport_error(&mut process_guard, &error, "thread/start response");
+                return Err(error);
+            }
+        };
         let thread_id = response
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("thread/start response missing thread id"))?
             .to_string();
-        process.shutdown().await?;
+        logging::info(&format!("codex start_thread got thread_id={thread_id}"));
         Ok(thread_id)
     }
 
@@ -123,26 +156,43 @@ impl CodexClient {
         F: FnMut(TurnEvent) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let mut process = AppServerProcess::spawn(&self.binary).await?;
-        process.initialize().await?;
-        let request_id = process
-            .send_request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "cwd": self.cwd.display().to_string(),
-                    "approvalPolicy": self.approval_policy,
-                    "model": self.model,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                            "text_elements": []
-                        }
-                    ]
-                }),
-            )
-            .await?;
+        logging::info(&format!(
+            "codex run_turn begin thread_id={} cwd={}",
+            thread_id,
+            self.cwd.display()
+        ));
+        let mut process_guard = self.process.lock().await;
+        ensure_process(
+            &mut process_guard,
+            &self.binary,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let request_id = match send_request_with_recovery(
+            &mut process_guard,
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "cwd": self.cwd.display().to_string(),
+                "approvalPolicy": self.approval_policy,
+                "model": self.model,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        "text_elements": []
+                    }
+                ]
+            }),
+        )
+        .await
+        {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                reset_process_after_transport_error(&mut process_guard, &error, "turn/start request");
+                return Err(error);
+            }
+        };
 
         let mut assistant_text = String::new();
         let mut interrupted = false;
@@ -157,15 +207,25 @@ impl CodexClient {
                     interrupt_sent = true;
                     interrupted = true;
                     if let Some(turn_id) = turn_started.as_deref() {
-                        let _ = process.send_request(
+                        let interrupt_result = send_request_with_recovery(
+                            &mut process_guard,
                             "turn/interrupt",
                             json!({"threadId": thread_id, "turnId": turn_id}),
-                        ).await?;
+                        )
+                        .await;
+                        if let Err(error) = interrupt_result {
+                            reset_process_after_transport_error(&mut process_guard, &error, "turn/interrupt");
+                            return Err(error);
+                        }
                     }
                 }
-                next = process.next_message() => {
-                    let Some(message) = next? else {
-                        break;
+                next = next_message_with_recovery(&mut process_guard) => {
+                    let message = match next {
+                        Ok(message) => message,
+                        Err(error) => {
+                            reset_process_after_transport_error(&mut process_guard, &error, "turn stream");
+                            return Err(error);
+                        }
                     };
                     match message {
                         RpcMessage::Response { id, result, error } => {
@@ -197,20 +257,141 @@ impl CodexClient {
                             ).await?;
                         }
                         RpcMessage::ServerRequest { id, method, params } => {
-                            handle_server_request(&mut process, id, &method, &params, &mut on_event).await?;
+                            let server_request = {
+                                let process = process_guard.as_mut().ok_or_else(|| {
+                                    anyhow!("codex app-server unavailable while handling server request")
+                                })?;
+                                handle_server_request(process, id, &method, &params, &mut on_event).await
+                            };
+                            if let Err(error) = server_request {
+                                reset_process_after_transport_error(&mut process_guard, &error, &format!("server request {method}"));
+                                return Err(error);
+                            }
                         }
                     }
                 }
             }
         }
 
-        process.shutdown().await?;
+        logging::info(&format!(
+            "codex run_turn done thread_id={} interrupted={}",
+            thread_id, interrupted
+        ));
         Ok(TurnRunResult {
             assistant_text,
             interrupted,
             last_status,
         })
     }
+}
+
+async fn ensure_process(
+    process_guard: &mut Option<AppServerProcess>,
+    binary: &Path,
+    initialize_timeout: Duration,
+) -> Result<()> {
+    if process_guard.is_some() {
+        logging::info("reusing existing codex app-server");
+        return Ok(());
+    }
+    let mut process = AppServerProcess::spawn(binary).await?;
+    let initialize_result = timeout(initialize_timeout, process.initialize()).await;
+    match initialize_result {
+        Ok(Ok(())) => {
+            logging::info("codex app-server initialized");
+        }
+        Ok(Err(error)) => {
+            logging::error(&format!("codex initialize failed: {error:#}"));
+            process.abort();
+            return Err(error);
+        }
+        Err(error) => {
+            logging::error(&format!("codex initialize timed out: {error}"));
+            process.abort();
+            return Err(anyhow!("timed out waiting for codex initialize"));
+        }
+    }
+    *process_guard = Some(process);
+    Ok(())
+}
+
+async fn send_request_with_recovery(
+    process_guard: &mut Option<AppServerProcess>,
+    method: &str,
+    params: Value,
+) -> Result<u64> {
+    let process = process_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("codex app-server unavailable before request"))?;
+    process.send_request(method, params).await
+}
+
+async fn await_response_with_timeout_and_recovery(
+    process_guard: &mut Option<AppServerProcess>,
+    expected_id: u64,
+    wait_timeout: Duration,
+    timeout_message: &str,
+) -> Result<Value> {
+    let process = process_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("codex app-server unavailable before awaiting response"))?;
+    timeout(wait_timeout, process.await_response(expected_id))
+        .await
+        .map_err(|_| anyhow!(timeout_message.to_string()))?
+}
+
+async fn next_message_with_recovery(process_guard: &mut Option<AppServerProcess>) -> Result<RpcMessage> {
+    let process = process_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("codex app-server unavailable before reading next message"))?;
+    match process.next_message().await? {
+        Some(message) => Ok(message),
+        None => Err(anyhow!("app-server closed during active turn")),
+    }
+}
+
+fn is_transport_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "failed reading app-server stdout",
+        "failed writing app-server request",
+        "failed flushing stdin",
+        "app-server closed before response",
+        "app-server closed during active turn",
+        "timed out waiting for codex initialize",
+        "timed out waiting for codex thread/start",
+        "broken pipe",
+        "pipe has been ended",
+        "channel closed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn reset_slot_on_transport_error<T>(slot: &mut Option<T>, error: &anyhow::Error) -> bool {
+    if !is_transport_error(error) {
+        return false;
+    }
+    *slot = None;
+    true
+}
+
+fn reset_process_after_transport_error(
+    process_guard: &mut Option<AppServerProcess>,
+    error: &anyhow::Error,
+    context: &str,
+) {
+    if !is_transport_error(error) {
+        return;
+    }
+    if let Some(mut process) = process_guard.take() {
+        logging::error(&format!(
+            "resetting codex app-server after transport error in {context}: {error:#}"
+        ));
+        process.abort();
+        return;
+    }
+    let _ = reset_slot_on_transport_error(process_guard, error);
 }
 
 async fn handle_notification<F, Fut>(
@@ -339,6 +520,7 @@ where
 
 impl AppServerProcess {
     async fn spawn(binary: &Path) -> Result<Self> {
+        logging::info(&format!("spawning codex app-server via {}", binary.display()));
         let mut child = spawnable_command(binary)
             .spawn()
             .with_context(|| format!("failed to spawn `{}`", binary.display()))?;
@@ -354,29 +536,23 @@ impl AppServerProcess {
             .stderr
             .take()
             .ok_or_else(|| anyhow!("codex app-server stderr unavailable"))?;
-        let stderr_buffer = Arc::new(Mutex::new(String::new()));
-        let stderr_clone = stderr_buffer.clone();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let mut buffer = stderr_clone.lock().await;
-                if !buffer.is_empty() {
-                    buffer.push('\n');
-                }
-                buffer.push_str(&line);
+                logging::error(&format!("codex stderr: {line}"));
             }
         });
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
-            stderr: stderr_buffer,
             stderr_task,
             next_id: 1,
         })
     }
 
     async fn initialize(&mut self) -> Result<()> {
+        logging::info("sending codex initialize");
         let request_id = self
             .send_request(
                 "initialize",
@@ -393,22 +569,26 @@ impl AppServerProcess {
             .await?;
         let _ = self.await_response(request_id).await?;
         self.send_notification("initialized").await?;
+        logging::info("codex initialize complete");
         Ok(())
     }
 
     async fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
+        logging::info(&format!("codex request id={} method={method}", id));
         self.write_line(&json!({"method": method, "id": id, "params": params}))
             .await?;
         Ok(id)
     }
 
     async fn send_result(&mut self, id: u64, result: Value) -> Result<()> {
+        logging::info(&format!("codex response id={id}"));
         self.write_line(&json!({"id": id, "result": result})).await
     }
 
     async fn send_notification(&mut self, method: &str) -> Result<()> {
+        logging::info(&format!("codex notification method={method}"));
         self.write_line(&json!({"method": method})).await
     }
 
@@ -434,12 +614,26 @@ impl AppServerProcess {
             let Some(line) = self
                 .stdout
                 .next_line()
-                .await
-                .context("failed reading app-server stdout")?
+            .await
+            .context("failed reading app-server stdout")?
             else {
                 return Ok(None);
             };
             if let Some(message) = parse_rpc_message(&line)? {
+                match &message {
+                    RpcMessage::Response { id, .. } => {
+                        logging::info(&format!("codex incoming response id={id}"));
+                    }
+                    RpcMessage::Notification { method, .. } => {
+                        logging::info(&format!("codex incoming notification method={method}"));
+                    }
+                    RpcMessage::ServerRequest { id, method, .. } => {
+                        logging::info(&format!(
+                            "codex incoming server request id={} method={}",
+                            id, method
+                        ));
+                    }
+                }
                 return Ok(Some(message));
             }
         }
@@ -456,14 +650,9 @@ impl AppServerProcess {
         Ok(())
     }
 
-    async fn shutdown(mut self) -> Result<()> {
-        terminate_child(&mut self.child).await;
-        let _ = self.stderr_task.await;
-        let stderr = self.stderr.lock().await;
-        if !stderr.trim().is_empty() {
-            eprintln!("codex stderr:\n{}", stderr.trim());
-        }
-        Ok(())
+    fn abort(&mut self) {
+        self.stderr_task.abort();
+        let _ = self.child.start_kill();
     }
 }
 
@@ -475,17 +664,6 @@ fn spawnable_command(binary: &Path) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
-}
-
-async fn terminate_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            let _ = child.kill().await;
-        }
-        Err(_) => {}
-    }
-    let _ = child.wait().await;
 }
 
 fn format_rpc_error(error: &RpcError) -> String {
@@ -527,6 +705,7 @@ fn parse_rpc_message(line: &str) -> Result<Option<RpcMessage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn parses_response_message() {
@@ -571,5 +750,21 @@ mod tests {
         .await
         .expect("notification");
         assert_eq!(assistant, "hello");
+    }
+
+    #[test]
+    fn transport_error_resets_slot() {
+        let mut slot = Some(123u32);
+        let error = anyhow!("failed writing app-server request: broken pipe");
+        assert!(reset_slot_on_transport_error(&mut slot, &error));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn business_error_does_not_reset_slot() {
+        let mut slot = Some(123u32);
+        let error = anyhow!("thread not found: abc | code -32600");
+        assert!(!reset_slot_on_transport_error(&mut slot, &error));
+        assert_eq!(slot, Some(123u32));
     }
 }

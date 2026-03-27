@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -8,6 +12,8 @@ pub struct Config {
     pub telegram_allowed_user_id: Option<i64>,
     pub codex_binary: PathBuf,
     pub codex_cwd: PathBuf,
+    pub log_path: PathBuf,
+    pub lock_path: PathBuf,
     pub codex_model: Option<String>,
     pub codex_approval_policy: String,
     pub poll_timeout_seconds: u64,
@@ -20,6 +26,8 @@ struct FileConfig {
     telegram_allowed_user_id: Option<i64>,
     codex_binary: Option<PathBuf>,
     codex_cwd: Option<PathBuf>,
+    log_path: Option<PathBuf>,
+    lock_path: Option<PathBuf>,
     codex_model: Option<String>,
     codex_approval_policy: Option<String>,
     poll_timeout_seconds: Option<u64>,
@@ -45,11 +53,21 @@ impl Config {
         Ok(Self {
             telegram_bot_token,
             telegram_allowed_user_id,
-            codex_binary: env::var_os("CODEX_BINARY")
-                .map(PathBuf::from)
-                .or(file_config.codex_binary)
-                .unwrap_or_else(|| PathBuf::from("codex")),
+            codex_binary: resolve_codex_binary(
+                env::var_os("CODEX_BINARY")
+                    .map(PathBuf::from)
+                    .or(file_config.codex_binary)
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             codex_cwd,
+            log_path: env::var_os("LOG_PATH")
+                .map(PathBuf::from)
+                .or(file_config.log_path)
+                .unwrap_or_else(|| PathBuf::from("bridge.log")),
+            lock_path: env::var_os("LOCK_PATH")
+                .map(PathBuf::from)
+                .or(file_config.lock_path)
+                .unwrap_or_else(|| PathBuf::from("bridge.lock")),
             codex_model: env::var("CODEX_MODEL").ok().or(file_config.codex_model),
             codex_approval_policy: env::var("CODEX_APPROVAL_POLICY")
                 .ok()
@@ -102,4 +120,84 @@ fn read_path(name: &str, fallback: Option<PathBuf>) -> Result<PathBuf> {
         .map(PathBuf::from)
         .or(fallback)
         .ok_or_else(|| anyhow!("{name} is required"))
+}
+
+fn resolve_codex_binary(binary: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        resolve_windows_command(binary)
+    }
+
+    #[cfg(not(windows))]
+    {
+        binary
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_command(binary: PathBuf) -> PathBuf {
+    if binary.components().count() > 1 || binary.extension().is_some() {
+        return binary;
+    }
+
+    let Ok(output) = Command::new("where.exe").arg(&binary).output() else {
+        return binary;
+    };
+    if !output.status.success() {
+        return binary;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut candidates: Vec<PathBuf> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    candidates.sort_by_key(|path| windows_command_rank(path));
+    candidates.into_iter().next().unwrap_or(binary)
+}
+
+#[cfg(windows)]
+fn windows_command_rank(path: &Path) -> (u8, String) {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    let is_windows_apps = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("\\windowsapps\\");
+
+    let ext_rank = match extension.as_deref() {
+        Some("cmd") => 0,
+        Some("bat") => 1,
+        Some("exe") => 2,
+        Some("com") => 3,
+        Some(_) => 4,
+        None => 5,
+    };
+    let windows_apps_rank = if is_windows_apps { 1 } else { 0 };
+    (ext_rank, format!("{windows_apps_rank}:{}", path.display()))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_cmd_over_extensionless_and_windowsapps_exe() {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Users\winka\AppData\Roaming\npm\codex"),
+            PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.313.5234.0_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+            ),
+            PathBuf::from(r"C:\Users\winka\AppData\Roaming\npm\codex.cmd"),
+        ];
+        candidates.sort_by_key(|path| windows_command_rank(path));
+        assert_eq!(
+            candidates.first().unwrap(),
+            &PathBuf::from(r"C:\Users\winka\AppData\Roaming\npm\codex.cmd")
+        );
+    }
 }

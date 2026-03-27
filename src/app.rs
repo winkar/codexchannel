@@ -2,8 +2,9 @@ use crate::{
     codex::{CodexClient, TurnEvent, TurnRunResult},
     commands::BotCommand,
     config::Config,
+    logging,
     state::{SessionSnapshot, SharedSessionState},
-    telegram::{TelegramClient, TelegramMessage},
+    telegram::{TelegramClient, TelegramMessage, is_telegram_poll_conflict},
 };
 use anyhow::{Result, anyhow};
 use std::{fmt::Write as _, sync::Arc, time::Duration};
@@ -37,6 +38,7 @@ impl App {
 
     pub async fn run(self) -> Result<()> {
         let mut offset: Option<i64> = None;
+        let mut consecutive_poll_conflicts = 0u32;
         loop {
             let updates = match self
                 .telegram
@@ -47,17 +49,53 @@ impl App {
                 )
                 .await
             {
-                Ok(updates) => updates,
+                Ok(updates) => {
+                    consecutive_poll_conflicts = 0;
+                    updates
+                }
                 Err(error) => {
+                    let error_text = format!("{error:#}");
+                    if is_telegram_poll_conflict(&error_text) {
+                        consecutive_poll_conflicts += 1;
+                        logging::error(&format!(
+                            "telegram polling conflict #{consecutive_poll_conflicts}: another poller is using the same bot token"
+                        ));
+                        if should_exit_after_poll_conflicts(consecutive_poll_conflicts) {
+                            let message = concat!(
+                                "telegram polling conflict persisted after 3 attempts; ",
+                                "local single-instance lock is active, so another program or machine is using the same bot token via getUpdates. ",
+                                "Stop the external poller or rotate TELEGRAM_BOT_TOKEN."
+                            );
+                            logging::error(message);
+                            return Err(anyhow!(message));
+                        }
+                        eprintln!(
+                            "telegram polling conflict: another poller is using the same bot token"
+                        );
+                        sleep(Duration::from_secs(self.config.poll_timeout_seconds + 2)).await;
+                        continue;
+                    }
+                    logging::error(&format!("telegram polling failed: {error:#}"));
                     eprintln!("telegram polling failed: {error:#}");
                     sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             };
+            if !updates.is_empty() {
+                logging::info(&format!("received {} telegram update(s)", updates.len()));
+            }
             for update in updates {
                 offset = Some(update.update_id + 1);
                 if let Some(message) = update.message {
+                    logging::info(&format!(
+                        "processing update {} message_id={} chat_id={} text={:?}",
+                        update.update_id, message.message_id, message.chat.id, message.text
+                    ));
                     if let Err(error) = self.handle_message(message).await {
+                        logging::error(&format!(
+                            "failed to process update {}: {error:#}",
+                            update.update_id
+                        ));
                         eprintln!("failed to process update {}: {error:#}", update.update_id);
                     }
                 }
@@ -96,27 +134,49 @@ impl App {
 
         match BotCommand::parse(text) {
             BotCommand::Start => {
+                logging::info("handling /start");
                 self.telegram
                     .send_message(message.chat.id, &self.render_help().await)
                     .await?;
             }
             BotCommand::New => {
+                logging::info("handling /new");
                 if self.session.has_active_turn().await {
                     self.telegram
                         .send_message(message.chat.id, "A turn is running. Use /stop first.")
                         .await?;
                     return Ok(());
                 }
-                let thread_id = self.codex.start_thread().await?;
-                self.session.set_active_thread(thread_id.clone()).await;
-                self.telegram
-                    .send_message(
-                        message.chat.id,
-                        &format!("Started new Codex thread:\n{thread_id}"),
-                    )
+                let pending = self
+                    .telegram
+                    .send_message(message.chat.id, "Creating new Codex thread...")
                     .await?;
+                match self.codex.start_thread().await {
+                    Ok(thread_id) => {
+                        logging::info(&format!("created thread {thread_id}"));
+                        self.session.set_active_thread(thread_id.clone()).await;
+                        self.telegram
+                            .edit_message(
+                                message.chat.id,
+                                pending.message_id,
+                                &format!("Started new Codex thread:\n{thread_id}"),
+                            )
+                            .await?;
+                    }
+                    Err(error) => {
+                        logging::error(&format!("failed to start thread: {error:#}"));
+                        self.telegram
+                            .edit_message(
+                                message.chat.id,
+                                pending.message_id,
+                                &format!("Failed to start Codex thread:\n{error:#}"),
+                            )
+                            .await?;
+                    }
+                }
             }
             BotCommand::Use(thread_id) => {
+                logging::info(&format!("handling /use {thread_id}"));
                 if self.session.has_active_turn().await {
                     self.telegram
                         .send_message(message.chat.id, "A turn is running. Use /stop first.")
@@ -132,12 +192,14 @@ impl App {
                     .await?;
             }
             BotCommand::Status => {
+                logging::info("handling /status");
                 let snapshot = self.session.snapshot().await;
                 self.telegram
                     .send_message(message.chat.id, &render_status(&snapshot, &self.config))
                     .await?;
             }
             BotCommand::Stop => {
+                logging::info("handling /stop");
                 if self.session.cancel_active_turn().await {
                     self.telegram
                         .send_message(message.chat.id, "Stop requested.")
@@ -149,6 +211,7 @@ impl App {
                 }
             }
             BotCommand::Prompt(prompt) => {
+                logging::info(&format!("handling prompt len={}", prompt.len()));
                 if self.session.has_active_turn().await {
                     self.telegram
                         .send_message(
@@ -165,7 +228,10 @@ impl App {
                     return Ok(());
                 };
 
-                let placeholder = self.telegram.send_message(message.chat.id, "⏳").await?;
+                let placeholder = self
+                    .telegram
+                    .send_message(message.chat.id, "Thinking...")
+                    .await?;
                 let cancel = CancellationToken::new();
                 let task = self.spawn_turn_task(
                     message.chat.id,
@@ -199,6 +265,7 @@ impl App {
                 .run_turn(chat_id, thread_id, prompt, message_id, cancel)
                 .await;
             if let Err(error) = result {
+                logging::error(&format!("turn failed: {error:#}"));
                 let _ = app
                     .telegram
                     .edit_message(chat_id, message_id, &format!("Turn failed:\n{error:#}"))
@@ -217,6 +284,7 @@ impl App {
         cancel: CancellationToken,
     ) -> Result<()> {
         let last_rendered = Arc::new(Mutex::new(String::new()));
+        logging::info(&format!("starting turn for thread {thread_id}"));
         let result = self
             .codex
             .run_turn(&thread_id, &prompt, cancel, |event| {
@@ -252,9 +320,19 @@ impl App {
             .await?;
         let final_cache = last_rendered.lock().await.clone();
         let final_text = finalize_text(&result, &final_cache);
-        self.telegram
-            .edit_message(chat_id, message_id, &final_text)
-            .await?;
+        logging::info(&format!(
+            "turn completed for thread {} interrupted={} final_len={}",
+            thread_id,
+            result.interrupted,
+            final_text.len()
+        ));
+        if final_text != final_cache {
+            self.telegram
+                .edit_message(chat_id, message_id, &final_text)
+                .await?;
+        } else {
+            logging::info("skipping final telegram edit because content is unchanged");
+        }
         Ok(())
     }
 
@@ -272,6 +350,10 @@ impl App {
             render_status(&snapshot, &self.config)
         )
     }
+}
+
+fn should_exit_after_poll_conflicts(consecutive: u32) -> bool {
+    consecutive >= 3
 }
 
 fn render_status(snapshot: &SessionSnapshot, config: &Config) -> String {
@@ -332,6 +414,8 @@ mod tests {
             telegram_allowed_user_id: Some(1),
             codex_binary: PathBuf::from("codex"),
             codex_cwd: PathBuf::from("C:/work"),
+            log_path: PathBuf::from("bridge.log"),
+            lock_path: PathBuf::from("bridge.lock"),
             codex_model: Some("gpt-5.4".to_string()),
             codex_approval_policy: "never".to_string(),
             poll_timeout_seconds: 30,
@@ -366,5 +450,11 @@ mod tests {
         let snapshot = session.snapshot().await;
         let text = render_status(&snapshot, &sample_config());
         assert!(text.contains("thread-123"));
+    }
+
+    #[test]
+    fn exits_after_three_poll_conflicts() {
+        assert!(!should_exit_after_poll_conflicts(2));
+        assert!(should_exit_after_poll_conflicts(3));
     }
 }

@@ -159,4 +159,4 @@ cargo build --release
 
 Latest GitHub release:
 
-- [`v0.1.2`](https://github.com/winkar/codexchannel/releases/tag/v0.1.2)
+- [`v0.1.3`](https://github.com/winkar/codexchannel/releases/tag/v0.1.3)
